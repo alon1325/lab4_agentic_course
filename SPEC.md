@@ -191,3 +191,21 @@ browser testing dependencies are development-only.
   bounded by 240 seconds. Test fixtures never require live provider credentials.
 - Keep main-worktree validation within 240 seconds per check run; run the second
   worktree checks without an overall timeout. Record actual verification results.
+
+### Rebuild verification — 2026-11-05
+
+- Reviewed the five implemented improvements in the current primary worktree.
+- Strengthened improvement 4: while waiting for its agent, `./start` now detects
+  an unexpected exit of the proxy it started, prints recovery instructions, stops
+  its launched agent, and returns failure. Dashboard-only mode also treats an
+  unexpected zero-status proxy exit as failure. Reused proxies are left running;
+  normal agent exit codes are preserved.
+- Actual local results: 33 Python tests passed, 37 JavaScript regression
+  assertions passed (two Node test files), and 9 Chromium browser tests passed.
+  Python, JavaScript, and browser check commands were bounded at or below 240
+  seconds. No second worktree was changed or validated in this pass.
+- A real `./start` equivalent (`python3 start.py --no-agent --no-browser` with
+  temporary ports) passed readiness and SIGTERM cleanup checks: health reported
+  automatic routing and both listening ports closed after shutdown.
+- Change details and verification are recorded in CHANGELOG.md. No live provider
+  call was made; authentication and live account connectivity were not tested.
