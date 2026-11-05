@@ -109,3 +109,38 @@ A call is **side** if any of these hold: it isn't `POST /v1/messages`; `max_toke
 4. **Buffer size / memory cap:** **2,000 events, large raw bodies kept only for the last 50 calls** vs. unbounded.
 5. **Export:** **none in v1** vs. a "download session as JSON" button.
 6. **Token / cost summary per session** (totals of input, output, cache): **show totals in the header** vs. omit.
+
+## Requested update: four implementation missions
+
+1. **Hide conversation context by default.** Agent-injected conversation context,
+   system reminders, developer instructions, and setup metadata must not appear in
+   the normal conversation thread, previews, or search. Keep original bytes in the
+   per-call raw view. An explicit context toggle may reveal context separately.
+2. **Hide environment context by default.** Treat `<environment_context>` blocks
+   (including working directory, shell, date, timezone, and workspace details) as
+   injected context, including mixed prompt/context messages and partial streamed
+   blocks. Preserve the actual user prompt and raw payloads.
+3. **Support Claude Code and Codex together.** Provide explicit provider selection,
+   correct upstream defaults and launch instructions for both, and readable live
+   prompts, replies, tool calls/results, and usage for Anthropic Messages and
+   OpenAI Responses. Keep forwarding unchanged and use only the standard library.
+4. **Remove protocol tags from the readable conversation.** Hide known agent
+   wrapper delimiters such as `<environment_context>`, `<system-reminder>`, and
+   context wrappers; retain meaningful enclosed user text. Do not strip arbitrary
+   HTML/XML or source code from ordinary messages, code blocks, or tool output.
+   Raw views retain all original tags. Role labels and tool names remain useful.
+
+### Update verification
+
+- Mixed user text and injected context retains the user text and hides context.
+- Hidden context is absent from the default display, preview, and search; explicit
+  context reveal works independently of ordinary messages.
+- Environment context and known protocol wrappers are covered by regression tests.
+- Both providers have tested request parsing, streamed replies, tool pairing,
+  upstream URL routing, and byte-preserving forwarding.
+- The first worktree's checks have a 240-second limit; the second worktree's
+  checks have no overall time limit. Four agents implement the missions in parallel.
+
+These requirements supersede the original Anthropic-only non-goal and default
+visibility of injected context. “Tags” currently means protocol markup wrappers;
+if the requester clarifies a different meaning, update mission 4 accordingly.
