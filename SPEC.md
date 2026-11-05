@@ -144,3 +144,37 @@ A call is **side** if any of these hold: it isn't `POST /v1/messages`; `max_toke
 These requirements supersede the original Anthropic-only non-goal and default
 visibility of injected context. “Tags” currently means protocol markup wrappers;
 if the requester clarifies a different meaning, update mission 4 accordingly.
+
+## Next five improvements
+
+Every implementation commit for this update must include its corresponding
+SPEC.md acceptance/status update. Runtime remains Python standard library only;
+browser testing dependencies are development-only.
+
+1. **Dashboard provider selector.** Choose All, Codex, or Claude in the dashboard.
+   Filter sessions to that provider and show its launch command. Recognize the
+   protocol of each API request and route it to the matching provider upstream,
+   so switching agents does not require restarting the proxy with terminal flags.
+   Keep per-call provider identity and existing sessions intact; custom upstream
+   overrides continue to take precedence.
+2. **Reliable Codex history.** Deduplicate repeated Responses items across tool
+   cycles, resumed sessions, and context compaction. Remember streamed replies as
+   individual normalized messages, preserve intentionally repeated user prompts,
+   and mark history rewrites instead of silently duplicating prior messages.
+3. **Actionable connection errors.** Distinguish a disconnected dashboard, missing
+   or failed proxy connection, upstream connectivity failure, authentication
+   failure (401/403), and rate limits (429). Show recovery instructions, preserve
+   raw details, and restore the live indicator after reconnecting.
+4. **Single startup command.** Start the proxy, wait for readiness, open its
+   dashboard, and launch the selected installed CLI using existing login. Support
+   Codex and Claude, custom ports, headless use, clean shutdown, and useful errors
+   for missing CLIs or occupied ports. Never terminate an unrelated process.
+5. **Real browser regression tests.** Exercise streaming, hidden context, search,
+   reconnect/replay, provider selection, and connection errors in a real browser.
+   Run entirely against local fixtures without paid API calls or credentials.
+
+### Progress and verification
+
+- Specification recorded before implementation; all five improvements pending.
+- Keep main-worktree validation within 240 seconds per check run; run the second
+  worktree checks without an overall timeout. Record actual verification results.
