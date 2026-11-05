@@ -175,6 +175,19 @@ browser testing dependencies are development-only.
 
 ### Progress and verification
 
-- Specification recorded before implementation; all five improvements pending.
+- All five improvements implemented. The dashboard selector filters sessions and
+  displays the selected launcher; one proxy routes both protocols automatically.
+- Codex ordered history handles individual streamed output items, resumed history,
+  retained suffixes after compaction, previous_response_id chains, provider session
+  isolation, and stale concurrent responses without hiding repeated user prompts.
+- Connection banners distinguish stream reconnects, unavailable proxy, upstream
+  failure, authentication errors, and rate limits, and clear after recovery.
+- `./start` starts/reuses a compatible auto-routing proxy, opens a WSL-compatible
+  browser, launches the selected CLI, and cleans up only processes it owns.
+- Real Chromium tests cover streaming/tools, context visibility/search/raw views,
+  reconnect without duplication, provider filtering, and actionable error recovery.
+- Validation: 30 Python tests, 37 JavaScript assertions, and 9 Playwright browser
+  tests pass locally. Both worktrees run the same checks; the primary check run is
+  bounded by 240 seconds. Test fixtures never require live provider credentials.
 - Keep main-worktree validation within 240 seconds per check run; run the second
   worktree checks without an overall timeout. Record actual verification results.

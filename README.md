@@ -39,8 +39,10 @@ python3 proxy.py --provider claude --port 8051 --ui-port 8052
 ./claude-proxy --proxy-port 8051
 ```
 
-The parsers recognize both protocols; each proxy process forwards to its selected
-upstream. `--upstream URL` overrides the selected provider's upstream.
+A single proxy automatically routes Codex and Claude requests to their matching
+upstreams. The dashboard provider selector filters sessions and shows the matching
+launch command. `--provider` selects the default for unrecognized side requests;
+`--upstream URL` explicitly overrides routing for all requests.
 Defaults: Codex uses https://chatgpt.com/backend-api/codex (ChatGPT sign-in),
 and Claude uses https://api.anthropic.com.
 For OpenAI API-key authentication, use `--upstream https://api.openai.com/v1`
@@ -60,3 +62,31 @@ node --test tests/*.js
 
 The main worktree's checks can be bounded with `timeout -k 5s 240s`; the second
 worktree can run the same commands without an overall timeout.
+
+## Start everything with one command
+
+From the repository directory, run:
+
+```bash
+./start
+```
+
+This starts the Codex proxy, waits for readiness, opens the dashboard in your
+browser (including the Windows browser from WSL), and starts Codex using your
+existing login. When Codex exits or you press Ctrl+C, the proxy started by this
+command also stops. A matching proxy already running is reused and left running.
+An auto-routing proxy can be reused by either Codex or Claude on the same ports.
+
+```bash
+./start --provider claude
+./start --port 8051 --ui-port 8052
+./start --no-browser
+./start --no-agent               # dashboard/proxy only, until Ctrl+C
+./start -- --help                # pass arguments to the selected agent
+```
+
+`python3 start.py` accepts the same options. The chosen CLI (`codex` or `claude`)
+must already be installed and signed in. If ports are occupied by an older or
+incompatible proxy, stop it or select another pair of ports.
+
+Browser regression setup and coverage: [tests/browser/README.md](tests/browser/README.md).

@@ -53,6 +53,26 @@ PROVIDER_UPSTREAMS = {
     "claude": "https://api.anthropic.com",
 }
 UPSTREAM = PROVIDER_UPSTREAMS["codex"]
+DEFAULT_PROVIDER = "codex"
+CUSTOM_UPSTREAM = False
+PROXY_PORT = 8041
+UI_PORT = 8042
+
+
+def request_provider(path: str) -> str:
+    bare = urlsplit(path).path.rstrip("/")
+    if bare.startswith("/v1/messages") or bare == "/api/hello":
+        return "claude"
+    if bare.endswith("/responses") or "/responses/" in bare or bare.endswith("/models"):
+        return "codex"
+    return DEFAULT_PROVIDER
+
+
+def request_upstream(path: str) -> str:
+    # Explicit overrides also support local fixture servers and organization gateways.
+    if CUSTOM_UPSTREAM or UPSTREAM not in PROVIDER_UPSTREAMS.values():
+        return UPSTREAM
+    return PROVIDER_UPSTREAMS[request_provider(path)]
 
 
 def stamp() -> str:
@@ -163,6 +183,32 @@ def common_prefix(a: list, b: list) -> int:
     return n
 
 
+def history_context(message) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") in ("system", "developer"):
+        return True
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    text = content.strip() if isinstance(content, str) else ""
+    # A mixed context/user message is not discardable context: its ordinary
+    # text may be a new user instruction even if later history overlaps.
+    return bool(re.fullmatch(
+        r"(?:<(environment_context|system-reminder|context_summary|conversation_summary)>"
+        r"[\s\S]*?</\1>\s*)+", text,
+    ))
+
+
+def history_anchor(message) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "assistant":
+        return True
+    content = message.get("content")
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
 class Track:
     """One conversation inside a session (the main agent, or a subagent)."""
 
@@ -171,7 +217,9 @@ class Track:
         self.label = "main" if index == 1 else f"thread {index}"
         self.sys_hash = sys_hash
         self.hashes: list = []
-        self.reply_pos = None  # position of the reply we appended from a stream
+        self.reply_pos = None  # start of the output appended from a stream
+        self.generation = 0
+        self.response_ids: set = set()
 
 
 class Sub:
@@ -259,45 +307,109 @@ class Dashboard:
                 return sid
             return self.last_session or "(no session)"
 
-    def assign(self, sid: str, messages: list, sys_hash: str):
-        """Find the track this call continues and which messages are new."""
+    def assign(self, sid: str, messages: list, sys_hash: str, *, responses=False,
+               previous_response_id=None):
+        """Match ordered history, never a global set of already-seen text.
+
+        Responses output items are stored separately, matching the separate input
+        items Codex echoes on its next request. A compaction may retain only a
+        suffix; recognize it only with an assistant/tool anchor, so a repeated
+        user prompt alone always remains a new prompt after a rewritten history.
+        """
         fps = [fingerprint(m) for m in messages]
         with self.lock:
             tracks = self.sessions.setdefault(sid, [])
+            info = {"new": False, "rewritten": 0}
+            parent = next((t for t in tracks if previous_response_id in t.response_ids), None) if previous_response_id else None
+            if parent is not None:
+                # The Responses API can send just the new input when referring
+                # to a prior response. It is an append, even if its text repeats.
+                parent.hashes.extend(fps)
+                parent.reply_pos = None
+                parent.generation += 1
+                info.update(index=parent.index, label=parent.label, total=len(tracks))
+                return parent, 0, info
+
             best, best_k = None, 0
             for t in tracks:
                 k = common_prefix(t.hashes, fps)
                 if k > best_k or (k == best_k and k > 0 and t.sys_hash == sys_hash):
                     best, best_k = t, k
-            info = {"new": False, "rewritten": 0}
-            if best is None:
-                best = Track(len(tracks) + 1, sys_hash)
-                tracks.append(best)
-                start = 0
-                info["new"] = True
+
+            # Find a suffix retained across compaction or a resumed short history.
+            # Only context may precede the retained suffix: do not discard a new
+            # user prompt just because later content resembles old history.
+            overlap_track, overlap_start, overlap_size = None, 0, 0
+            if responses:
+                for t in tracks:
+                    for incoming_start in range(len(fps)):
+                        if incoming_start and not history_context(messages[incoming_start - 1]):
+                            break
+                        max_size = min(len(t.hashes), len(fps) - incoming_start)
+                        for size in range(max_size, overlap_size, -1):
+                            window = messages[incoming_start:incoming_start + size]
+                            anchored = any(history_anchor(m) for m in window)
+                            if anchored and t.hashes[-size:] == fps[incoming_start:incoming_start + size]:
+                                overlap_track, overlap_start, overlap_size = t, incoming_start, size
+                                break
+                if overlap_track is not None and overlap_start + overlap_size > best_k:
+                    best = overlap_track
+                    start = overlap_start + overlap_size
+                    info["rewritten"] = len(best.hashes) - overlap_size
+                else:
+                    start = best_k
             else:
                 start = best_k
+
+            if best is None:
+                # A changed Codex context still belongs to its existing thread
+                # when that thread is unambiguous; report the rewrite explicitly.
+                compatible = [t for t in tracks if t.sys_hash == sys_hash]
+                if responses and not compatible and len(tracks) == 1:
+                    compatible = tracks
+                if responses and len(compatible) == 1:
+                    best = compatible[0]
+                    info["rewritten"] = len(best.hashes)
+                    start = 0
+                else:
+                    best = Track(len(tracks) + 1, sys_hash)
+                    tracks.append(best)
+                    start = 0
+                    info["new"] = True
+            elif overlap_track is not best or start == best_k:
                 if best_k < len(best.hashes):
                     reply_mismatch = (
-                        best.reply_pos == best_k
+                        not responses
+                        and best.reply_pos == best_k
                         and best_k == len(best.hashes) - 1
                         and best_k < len(messages)
                         and isinstance(messages[best_k], dict)
                         and messages[best_k].get("role") == "assistant"
                     )
-                    if reply_mismatch:  # the reply we streamed, sent back in another form
+                    if reply_mismatch:  # Anthropic may regroup its assistant blocks
                         start = best_k + 1
                     else:
                         info["rewritten"] = len(best.hashes) - best_k
             best.hashes = fps
             best.reply_pos = None
+            best.generation += 1
             info.update(index=best.index, label=best.label, total=len(tracks))
             return best, start, info
 
-    def add_reply(self, track: Track, reply_fp: str) -> None:
+    def add_replies(self, track: Track, reply_fps: list, response_id=None, generation=None) -> None:
         with self.lock:
-            track.hashes.append(reply_fp)
-            track.reply_pos = len(track.hashes) - 1
+            # A slower concurrent response must not append to a newer request's
+            # history snapshot. Its output remains available in its own raw call.
+            if generation is not None and generation != track.generation:
+                return
+            if response_id:
+                track.response_ids.add(response_id)
+            if reply_fps:
+                track.reply_pos = len(track.hashes)
+                track.hashes.extend(reply_fps)
+
+    def add_reply(self, track: Track, reply_fp: str) -> None:
+        self.add_replies(track, [reply_fp])
 
 
 DASH = Dashboard()
@@ -363,6 +475,8 @@ class CallTap:
             self.t0 = time.time()
             self.kind = "side"
             self.track = None
+            self.track_generation = None
+            self.response_id = None
             self.status = None
             self.reason = ""
             self.resp_headers: list = []
@@ -433,13 +547,18 @@ class CallTap:
         if kind == "main":
             messages = req.get("messages") if isinstance(req.get("messages"), list) else []
             sys_hash = hashlib.sha1(sys_txt.encode("utf-8", "replace")).hexdigest()
-            self.track, start, track_info = DASH.assign(sid, messages, sys_hash)
+            self.track, start, track_info = DASH.assign(
+                f"{request_provider(self.path)}:{sid}", messages, sys_hash, responses=self.responses_api,
+                previous_response_id=req.get("previous_response_id") if self.responses_api else None,
+            )
+            self.track_generation = self.track.generation
             new_messages = shrink(messages[start:])
 
         DASH.publish({
             "type": "call_start",
             "call_id": self.call_id,
             "session_id": sid,
+            "provider": request_provider(self.path),
             "time": int(self.t0 * 1000),
             "method": self.method,
             "path": self.path,
@@ -515,6 +634,9 @@ class CallTap:
             self.error = f"{err.get('type', 'error')}: {err.get('message', '')}".strip()
 
     def responses_event(self, typ: str, obj: dict) -> None:
+        response = obj.get("response") or {}
+        if response.get("id"):
+            self.response_id = response["id"]
         # Give every output item/content part a stable dashboard block index.
         index = obj.get("output_index", 0) * 10000 + obj.get("content_index", obj.get("summary_index", 0))
         if typ == "response.output_item.added":
@@ -627,6 +749,21 @@ class CallTap:
             return None
         return fingerprint({"role": "assistant", "content": content})
 
+    def reply_fingerprints(self) -> list:
+        if not self.responses_api:
+            fp = self.reply_fingerprint()
+            return [fp] if fp else []
+        items = {}
+        for index in sorted(self.blocks):
+            block = self.blocks[index]
+            group = items.setdefault(index // 10000, [])
+            if block["type"] == "text":
+                group.append({"type": "text", "text": "".join(block["text"])})
+            elif block["type"] in ("tool_use", "server_tool_use") and block.get("id"):
+                group.append({"type": "tool_use", "id": block["id"]})
+        return [fingerprint({"role": "assistant", "content": content})
+                for content in items.values() if content]
+
     # -- end ---------------------------------------------------------------------
     @guarded
     def finish(self, error: str | None = None) -> None:
@@ -648,9 +785,8 @@ class CallTap:
         if self.status and self.status >= 400 and not self.error:
             self.error = f"HTTP {self.status} {self.reason}"
         if self.kind == "main" and self.track and self.status == 200 and not self.error:
-            fp = self.reply_fingerprint()
-            if fp:
-                DASH.add_reply(self.track, fp)
+            DASH.add_replies(self.track, self.reply_fingerprints(),
+                             response_id=self.response_id, generation=self.track_generation)
         u = self.usage
         DASH.publish({
             "type": "call_end",
@@ -724,6 +860,11 @@ class UI(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             if parts.path in ("/", "/index.html"):
                 self.send_bytes(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+            elif parts.path == "/health":
+                health = {"status": "ok", "provider": DEFAULT_PROVIDER,
+                          "proxy_port": PROXY_PORT, "ui_port": UI_PORT,
+                          "upstream": UPSTREAM, "auto_route": not CUSTOM_UPSTREAM}
+                self.send_bytes(200, "application/json", json.dumps(health).encode())
             elif parts.path == "/events":
                 self.events(parts.query)
             elif parts.path.startswith("/raw/"):
@@ -820,7 +961,8 @@ class Tap(BaseHTTPRequestHandler):
         tap = CallTap(self.command, self.path, self.headers, body)  # dashboard side effect
 
         # 2. Forward it, headers intact.
-        target = urlsplit(UPSTREAM)
+        selected_upstream = request_upstream(self.path)
+        target = urlsplit(selected_upstream)
         conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
         # Connect with a short timeout (a lost SYN must not stall the agent for
         # minutes); the long timeout is for reading a slow stream.
@@ -828,11 +970,12 @@ class Tap(BaseHTTPRequestHandler):
         try:
             upstream.connect()
         except OSError as e:
-            print(f"\n[{stamp()}] !!! cannot reach {UPSTREAM}: {e}", flush=True)
-            tap.finish(error=f"proxy: cannot reach {UPSTREAM}: {e}")
-            self.send_error(502, f"proxy: cannot reach {UPSTREAM}: {e}")
+            print(f"\n[{stamp()}] !!! cannot reach {selected_upstream}: {e}", flush=True)
+            tap.finish(error=f"proxy: cannot reach {selected_upstream}: {e}")
+            self.send_error(502, f"proxy: cannot reach {selected_upstream}: {e}")
             self.close_connection = True
             return
+        response_started = False
         try:
             upstream.sock.settimeout(600)
             headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP}
@@ -843,6 +986,7 @@ class Tap(BaseHTTPRequestHandler):
             # 3. Stream the reply back as it arrives, printing it on the way.
             print(f"\n[{stamp()}] <<< {reply.status} {reply.reason}", flush=True)
             tap.response(reply.status, reply.reason, reply.getheaders())
+            response_started = True
             self.send_response(reply.status, reply.reason)
             for name, value in reply.getheaders():
                 if name.lower() not in SKIP and name.lower() != "content-encoding":
@@ -862,9 +1006,13 @@ class Tap(BaseHTTPRequestHandler):
             self.close_connection = True
             print(f"\n[{stamp()}] --- done", flush=True)
             tap.finish()
-        except BaseException as e:
-            tap.finish(error=f"proxy: {type(e).__name__}: {e}")
-            raise
+        except Exception as e:
+            tap.finish(error=f"proxy: cannot reach upstream: {type(e).__name__}: {e}")
+            if not response_started:
+                self.send_error(502, "Cannot reach upstream; check your connection and upstream URL")
+            self.close_connection = True
+        finally:
+            upstream.close()
 
 
 def serve_ui(port: int) -> None:
@@ -880,7 +1028,7 @@ def serve_ui(port: int) -> None:
 
 
 def main() -> None:
-    global UPSTREAM
+    global UPSTREAM, DEFAULT_PROVIDER, CUSTOM_UPSTREAM, PROXY_PORT, UI_PORT
     parser = argparse.ArgumentParser(description="Print and forward an agent's API traffic.")
     parser.add_argument("--port", type=int, default=8041)
     parser.add_argument("--ui-port", type=int, default=8042, help="dashboard port (default 8042)")
@@ -888,6 +1036,9 @@ def main() -> None:
                         help="upstream provider (default: codex)")
     parser.add_argument("--upstream", help="override the selected provider upstream URL")
     args = parser.parse_args()
+    DEFAULT_PROVIDER = args.provider
+    CUSTOM_UPSTREAM = args.upstream is not None
+    PROXY_PORT, UI_PORT = args.port, args.ui_port
     UPSTREAM = (args.upstream or PROVIDER_UPSTREAMS[args.provider]).rstrip("/")
     target = urlsplit(UPSTREAM)
     if target.scheme not in ("http", "https") or not target.netloc or target.query or target.fragment:
@@ -1044,6 +1195,9 @@ details.inp pre{color:var(--fg);background:var(--panel);border:1px solid var(--l
 .siderow .x{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
 body.hide-side .call.side{display:none}
 body.hide-thinking .k-think{display:none}
+#connection-detail{padding:10px 20px;background:var(--you-bg);border-bottom:1px solid var(--line)}
+#connection-detail.error{background:var(--err-bg);color:var(--err)}
+#launch-help{padding:6px 20px;color:var(--dim);font-size:12px}
 body.hide-injected .k-inj,body.hide-injected .setup{display:none}
 .miss{display:none!important}
 mark{background:var(--hl);color:inherit}
@@ -1057,6 +1211,7 @@ mark{background:var(--hl);color:inherit}
 <header>
   <h1>Agent traffic</h1>
   <div id="status" class="down"><span class="dot"></span><span id="statustext">connecting…</span></div>
+  <select id="provider" aria-label="Provider"><option value="all">All providers</option><option value="codex">Codex</option><option value="claude">Claude Code</option></select>
   <select id="session" title="Session"><option value="auto">Latest session (auto)</option></select>
   <div class="filters">
     <label><input type="checkbox" id="f-side"> side calls</label>
@@ -1067,6 +1222,8 @@ mark{background:var(--hl);color:inherit}
   <span id="matches"></span>
   <span id="totals"></span>
 </header>
+<div id="connection-detail" role="status" hidden></div>
+<div id="launch-help">Start an agent: <code id="launch-command">./codex-proxy</code></div>
 <main id="scroller">
   <div id="thread">
     <div class="empty" id="empty">Waiting for traffic…<br>Run the agent with <code>./codex-proxy</code></div>
@@ -1267,11 +1424,11 @@ function md(src) {
 /* ---------- state ---------- */
 const S = {
   sessions: new Map(), calls: new Map(),
-  selected: 'auto', auto: null, shown: null,
+  selected: 'auto', auto: null, shown: null, provider: 'all', proxyPort: 8041, connected: false,
   stick: true, newCount: 0, boot: null, replaying: false, q: '',
 };
 
-function session(id, t) {
+function session(id, t, provider) {
   let s = S.sessions.get(id);
   if (!s) {
     const root = h('div', 'session');
@@ -1280,22 +1437,42 @@ function session(id, t) {
     setup.hidden = true;
     root.appendChild(setup);
     thread.appendChild(root);
-    s = {id, root, setup, tools: new Map(), first: t, last: t, lastMain: 0, prompt: '',
+    s = {id, provider, root, setup, tools: new Map(), first: t, last: t, lastMain: 0, prompt: '',
          totals: {in: 0, out: 0, cr: 0, cw: 0, calls: 0}, tracks: 0};
     S.sessions.set(id, s);
-    $('#empty').hidden = true;
     refreshPicker();
   }
   s.last = Math.max(s.last, t || 0);
   return s;
 }
+const acceptsProvider = s => s && (S.provider === 'all' || s.provider === S.provider);
 const visible = () => S.selected === 'auto' ? S.auto : S.sessions.get(S.selected);
+function selectProvider() {
+  S.provider = $('#provider').value;
+  S.selected = 'auto';
+  $('#session').value = 'auto';
+  if (S.shown) S.shown.root.hidden = true;
+  S.shown = null;
+  S.auto = [...S.sessions.values()].filter(acceptsProvider).sort((a, b) => b.last - a.last)[0] || null;
+  if (S.auto) show(S.auto);
+  $('#empty').hidden = !!S.auto;
+  if (!S.auto) $('#empty').textContent = 'Waiting for ' + (S.provider === 'all' ? 'agent' : S.provider) + ' traffic…';
+  refreshPicker(); renderTotals(); updateLaunchHelp();
+}
+function updateLaunchHelp() {
+  const suffix = S.proxyPort === 8041 ? '' : ' --proxy-port ' + S.proxyPort;
+  $('#launch-command').textContent = S.provider === 'all'
+    ? './codex-proxy' + suffix + ' or ./claude-proxy' + suffix
+    : './' + S.provider + '-proxy' + suffix;
+}
+$('#provider').addEventListener('change', selectProvider);
 
 function show(s) {
-  if (!s || S.shown === s) return;
+  if (!acceptsProvider(s) || S.shown === s) return;
   if (S.shown) S.shown.root.hidden = true;
   s.root.hidden = false;
   S.shown = s;
+  $('#empty').hidden = true;
   applySearch();
   renderTotals();
   S.stick = true; S.newCount = 0; updateNewBtn();
@@ -1308,7 +1485,7 @@ function refreshPicker() {
   pickerTimer = setTimeout(() => {
     pickerTimer = 0;
     const sel = $('#session'), keep = sel.value;
-    const list = [...S.sessions.values()].sort((a, b) => b.last - a.last);
+    const list = [...S.sessions.values()].filter(acceptsProvider).sort((a, b) => b.last - a.last);
     sel.innerHTML = '<option value="auto">Latest session (auto)</option>' + list.map(s =>
       `<option value="${esc(s.id)}">${clock(s.first)} · ${esc(s.id.slice(0, 8))}${s.prompt ? ' · ' + esc(s.prompt.slice(0, 48)) : ''}</option>`).join('');
     sel.value = [...sel.options].some(o => o.value === keep) ? keep : 'auto';
@@ -1586,7 +1763,8 @@ async function toggleRaw(call) {
 
 /* ---------- event handlers ---------- */
 function onCallStart(ev) {
-  const s = session(ev.session_id, ev.time);
+  const provider = ev.provider || (ev.path.includes('responses') ? 'codex' : 'claude');
+  const s = session(provider + ':' + ev.session_id, ev.time, provider);
   const side = ev.kind !== 'main';
   const root = h('div', 'call ' + (side ? 'side' : 'main'));
   s.root.appendChild(root);
@@ -1625,10 +1803,11 @@ function onCallStart(ev) {
     call.foot = foot;
     grew(s, false);
   }
-  if (!side || !S.auto) {
+  if (acceptsProvider(s) && (!side || !S.auto)) {
     if (S.auto !== s) {
       S.auto = s;
       if (S.selected === 'auto') show(s);
+      $('#empty').hidden = true;
     }
   }
   if (s === S.shown) renderTotals();
@@ -1724,8 +1903,13 @@ function onCallEnd(ev) {
   for (const b of call.blocks.values()) {   // a stream cut off mid-block: drop the cursor
     if (!b.done && b.render && b.e && b.e.isConnected) { b.done = true; dirty.delete(b); b.render(true); }
   }
+  if (ev.error || (ev.status && ev.status >= 400)) {
+    connectionDetail(recoveryMessage(ev), 'upstream');
+  } else if (S.connected && $('#connection-detail').dataset.kind === 'upstream') {
+    connectionDetail('');
+  }
   if (call.side) { updateSideRow(call); return; }
-  if (ev.error) errorEntry(call, ev.error);
+  if (ev.error) errorEntry(call, recoveryMessage(ev) + " " + ev.error);
   const f = call.foot;
   const bits = [
     `<span>${esc(ev.model || call.ev.model || '')}</span>`,
@@ -1783,14 +1967,46 @@ bindFilter('#f-think', 'hide-thinking');
 bindFilter('#f-inj', 'hide-injected');
 
 /* ---------- connection ---------- */
+function connectionDetail(message, kind = '') {
+  const detail = $('#connection-detail');
+  detail.textContent = message;
+  detail.hidden = !message;
+  detail.dataset.kind = kind;
+  detail.classList.toggle('error', !!message);
+}
+function recoveryMessage(ev) {
+  const provider = S.calls.get(ev.call_id)?.s.provider || 'agent';
+  if (ev.status === 401 || ev.status === 403)
+    return 'Authentication failed (' + ev.status + '). Sign in again with ' + provider + ' login, then restart the agent.';
+  if (ev.status === 429)
+    return 'Rate limit reached (429). Wait before retrying; check your provider usage limits.';
+  if (!ev.status || ev.status === 502 || ev.status === 504)
+    return 'Cannot reach upstream. Check your internet connection and upstream URL, then retry.';
+  return 'Upstream returned HTTP ' + ev.status + '. Open raw details and retry when the provider recovers.';
+}
+async function checkHealth(disconnected = false) {
+  try {
+    const response = await fetch('/health', {signal: AbortSignal.timeout(3000)});
+    if (!response.ok) throw new Error('health HTTP ' + response.status);
+    const health = await response.json();
+    S.proxyPort = health.proxy_port || 8041;
+    updateLaunchHelp();
+    if (disconnected && !S.connected)
+      connectionDetail('Dashboard stream disconnected. The proxy is running; reconnecting automatically…', 'connection');
+  } catch (error) {
+    if (!S.connected) connectionDetail('Proxy unavailable. Start it with ./start, then reload this page.', 'connection');
+  }
+}
 function setStatus(live, text) {
+  S.connected = live;
   $('#status').className = live ? 'live' : 'down';
   $('#statustext').textContent = text;
+  if (live && $('#connection-detail').dataset.kind === 'connection') connectionDetail('');
 }
 function connect() {
   const es = new EventSource('/events');
   es.onopen = () => setStatus(true, 'live');
-  es.onerror = () => setStatus(false, 'reconnecting…');
+  es.onerror = () => { setStatus(false, 'reconnecting…'); checkHealth(true); };
   es.onmessage = m => {
     let ev;
     try { ev = JSON.parse(m.data); } catch (e) { return; }
@@ -1812,6 +2028,7 @@ function connect() {
     } catch (e) { console.error('dashboard event failed', ev, e); }
   };
 }
+checkHealth();
 connect();
 </script>
 </body>
