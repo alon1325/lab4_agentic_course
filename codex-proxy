@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+proxy_port=8041
+if [[ "${1:-}" == "--proxy-port" ]]; then
+  proxy_port="${2:?Missing proxy port}"
+  shift 2
+fi
+[[ "$proxy_port" =~ ^[0-9]+$ ]] && (( proxy_port >= 1 && proxy_port <= 65535 )) || { echo "Invalid proxy port" >&2; exit 2; }
+exec codex --no-daemon \
+  -c 'model_provider="lab_proxy"' \
+  -c 'model_providers.lab_proxy.name="Local traffic dashboard"' \
+  -c "model_providers.lab_proxy.base_url=\"http://127.0.0.1:${proxy_port}\"" \
+  -c 'model_providers.lab_proxy.wire_api="responses"' \
+  -c 'model_providers.lab_proxy.requires_openai_auth=true' \
+  -c 'model_providers.lab_proxy.supports_websockets=false' "$@"

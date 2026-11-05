@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+proxy_port=8041
+if [[ "${1:-}" == "--proxy-port" ]]; then
+  proxy_port="${2:?Missing proxy port}"
+  shift 2
+fi
+[[ "$proxy_port" =~ ^[0-9]+$ ]] && (( proxy_port >= 1 && proxy_port <= 65535 )) || { echo "Invalid proxy port" >&2; exit 2; }
+export ANTHROPIC_BASE_URL="http://127.0.0.1:${proxy_port}"
+exec claude "$@"

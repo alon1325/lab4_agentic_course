@@ -5,9 +5,9 @@ A reverse proxy that prints every request and response and forwards them
 unchanged. Standard library only; nothing to install.
 
     python3 proxy.py                       # listens on http://localhost:8041
-    ANTHROPIC_BASE_URL=http://localhost:8041 claude
+    ./codex-proxy
 
-Everything Claude Code sends to the API now passes through this program and is
+Everything Codex or Claude Code sends to the API passes through this program and is
 printed to the terminal. The proxy changes nothing: headers go through untouched
 (a subscription login needs its bearer token and its `anthropic-beta` header),
 and the reply is streamed back byte for byte as it arrives.
@@ -17,7 +17,8 @@ While it runs, open http://localhost:8042 to watch the conversation live
 breaks forwarding, and any dashboard error is only logged.
 
     python3 proxy.py --port 9000 --ui-port 9001
-    python3 proxy.py --upstream https://chatgpt.com/backend-api/codex   # for Codex
+    python3 proxy.py --provider claude     # then ./claude-proxy
+    python3 proxy.py --provider codex      # then ./codex-proxy
 """
 
 from __future__ import annotations
@@ -47,7 +48,11 @@ SKIP = {
     "content-length",
 }
 
-UPSTREAM = "https://api.anthropic.com"
+PROVIDER_UPSTREAMS = {
+    "codex": "https://chatgpt.com/backend-api/codex",
+    "claude": "https://api.anthropic.com",
+}
+UPSTREAM = PROVIDER_UPSTREAMS["codex"]
 
 
 def stamp() -> str:
@@ -77,7 +82,7 @@ def redact_headers(items) -> list:
     out = []
     for k, v in items:
         if k.lower() in REDACT:
-            v = v[:16] + "..."
+            v = "[REDACTED]"
         out.append([k, v])
     return out
 
@@ -314,6 +319,33 @@ def guarded(fn):
     return wrapper
 
 
+def responses_messages(items):
+    """Normalize Responses input for the existing readable thread renderer."""
+    if isinstance(items, str):
+        return [{"role": "user", "content": items}]
+    messages = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        typ = item.get("type", "message")
+        if typ == "message":
+            content = item.get("content", [])
+            if isinstance(content, list):
+                content = [{"type": "text", "text": part.get("text", "")} if part.get("type") in ("input_text", "output_text") else part for part in content if isinstance(part, dict)]
+            messages.append({"role": item.get("role", "user"), "content": content})
+        elif typ in ("function_call", "custom_tool_call"):
+            raw = item.get("arguments", item.get("input", ""))
+            try:
+                args = json.loads(raw)
+            except (ValueError, TypeError):
+                args = raw
+            messages.append({"role": "assistant", "content": [{"type": "tool_use", "id": item.get("call_id"), "name": item.get("name"), "input": args}]})
+        elif typ in ("function_call_output", "custom_tool_call_output"):
+            output = item.get("output", "")
+            messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": item.get("call_id"), "content": output if isinstance(output, str) else json.dumps(output)}]})
+    return messages
+
+
 class CallTap:
     """Watches one proxied call and turns it into dashboard events."""
 
@@ -326,7 +358,8 @@ class CallTap:
             self.call_id = DASH.new_call_id()
             self.method, self.path, self.body = method, path, body
             self.req_headers = redact_headers(headers.items())
-            self.header_sid = headers.get("X-Claude-Code-Session-Id")
+            self.header_sid = headers.get("session_id") or headers.get("x-codex-session-id") or headers.get("X-Claude-Code-Session-Id")
+            self.responses_api = False
             self.t0 = time.time()
             self.kind = "side"
             self.track = None
@@ -362,10 +395,17 @@ class CallTap:
         if not isinstance(req, dict):
             req = None
         bare = self.path.split("?", 1)[0]
+        self.responses_api = bare.rstrip("/").endswith("/responses")
+        if self.responses_api and req:
+            req = dict(req)
+            req["messages"] = responses_messages(req.get("input", []))
+            req["system"] = req.get("instructions", "")
         sys_txt = system_text(req.get("system")) if req else ""
         tools = req.get("tools") if req and isinstance(req.get("tools"), list) else []
 
-        if self.method != "POST" or bare != "/v1/messages":
+        if self.responses_api and self.method == "POST" and req:
+            kind, why = "main", "Codex Responses API"
+        elif self.method != "POST" or bare != "/v1/messages":
             kind, why = "side", f"{self.method} {bare}"
         elif req is None:
             kind, why = "side", "unparsed body"
@@ -451,7 +491,9 @@ class CallTap:
         if not isinstance(obj, dict):
             return
         typ = obj.get("type") or name
-        if typ == "message_start":
+        if isinstance(typ, str) and typ.startswith("response."):
+            self.responses_event(typ, obj)
+        elif typ == "message_start":
             msg = obj.get("message") or {}
             self.model = msg.get("model") or self.model
             self.usage.update(msg.get("usage") or {})
@@ -471,6 +513,52 @@ class CallTap:
         elif typ == "error":
             err = obj.get("error") or {}
             self.error = f"{err.get('type', 'error')}: {err.get('message', '')}".strip()
+
+    def responses_event(self, typ: str, obj: dict) -> None:
+        # Give every output item/content part a stable dashboard block index.
+        index = obj.get("output_index", 0) * 10000 + obj.get("content_index", obj.get("summary_index", 0))
+        if typ == "response.output_item.added":
+            item = obj.get("item") or {}
+            if item.get("type") in ("function_call", "custom_tool_call"):
+                self.block_start(index, {"type": "tool_use", "name": item.get("name"), "id": item.get("call_id")})
+        elif typ in ("response.output_text.delta", "response.reasoning_summary_text.delta"):
+            thinking = "reasoning" in typ
+            if index not in self.blocks:
+                self.block_start(index, {"type": "thinking" if thinking else "text"})
+            self.block_delta(index, {"type": "thinking_delta" if thinking else "text_delta",
+                                     "thinking" if thinking else "text": obj.get("delta", "")})
+        elif typ == "response.function_call_arguments.delta":
+            self.block_delta(index, {"type": "input_json_delta", "partial_json": obj.get("delta", "")})
+        elif typ == "response.custom_tool_call_input.delta":
+            self.block_delta(index, {"type": "input_json_delta", "partial_json": obj.get("delta", "")})
+        elif typ == "response.output_item.done":
+            item = obj.get("item") or {}
+            if item.get("type") in ("function_call", "custom_tool_call"):
+                if index not in self.blocks:
+                    self.block_start(index, {"type": "tool_use", "name": item.get("name"), "id": item.get("call_id")})
+                if not self.blocks[index]["json"]:
+                    self.block_delta(index, {"type": "input_json_delta", "partial_json": item.get("arguments", item.get("input", ""))})
+            elif item.get("type") in ("message", "reasoning"):
+                thinking = item["type"] == "reasoning"
+                for part_index, part in enumerate(item.get("summary" if thinking else "content") or []):
+                    key = index + part_index
+                    if part.get("type") not in ("output_text", "summary_text") or key in self.blocks:
+                        continue
+                    self.block_start(key, {"type": "thinking" if thinking else "text"})
+                    self.block_delta(key, {"type": "thinking_delta" if thinking else "text_delta",
+                                           "thinking" if thinking else "text": part.get("text", "")})
+            for key in sorted(self.blocks):
+                if key // 10000 == index // 10000:
+                    self.block_stop(key)
+        elif typ in ("response.completed", "response.failed", "response.incomplete"):
+            response = obj.get("response") or {}
+            self.model = response.get("model") or self.model
+            self.stop_reason = response.get("status")
+            usage = response.get("usage") or {}
+            self.usage.update(usage)
+            self.usage["cache_read_input_tokens"] = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+            if response.get("error"):
+                self.error = json.dumps(response["error"])
 
     def block_start(self, index: int, cb: dict) -> None:
         t = cb.get("type", "text")
@@ -590,12 +678,16 @@ class CallTap:
             return
         if not isinstance(obj, dict):
             return
-        if obj.get("type") == "error" or "error" in obj:
+        if obj.get("type") == "error" or obj.get("error"):
             err = obj.get("error")
             if isinstance(err, dict):
                 self.error = f"{err.get('type', 'error')}: {err.get('message', '')}"
             else:
                 self.error = str(err)[:500]
+        elif obj.get("object") == "response" or (self.responses_api and "output" in obj):
+            for i, item in enumerate(obj.get("output") or []):
+                self.responses_event("response.output_item.done", {"output_index": i, "item": item})
+            self.responses_event("response.completed", {"response": obj})
         elif obj.get("type") == "message":  # non-streaming reply
             self.model = obj.get("model") or self.model
             self.stop_reason = obj.get("stop_reason")
@@ -717,7 +809,7 @@ class Tap(BaseHTTPRequestHandler):
         print(f"\n{'=' * 78}\n[{stamp()}] >>> {self.command} {self.path}", flush=True)
         for name, value in self.headers.items():
             if name.lower() in ("authorization", "x-api-key"):
-                value = value[:16] + "..."
+                value = "[REDACTED]"
             print(f"    {name}: {value}")
         if body:
             try:
@@ -792,14 +884,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Print and forward an agent's API traffic.")
     parser.add_argument("--port", type=int, default=8041)
     parser.add_argument("--ui-port", type=int, default=8042, help="dashboard port (default 8042)")
-    parser.add_argument("--upstream", default=UPSTREAM, help="where to forward (default: the Anthropic API)")
+    parser.add_argument("--provider", choices=tuple(PROVIDER_UPSTREAMS), default="codex",
+                        help="upstream provider (default: codex)")
+    parser.add_argument("--upstream", help="override the selected provider upstream URL")
     args = parser.parse_args()
-    UPSTREAM = args.upstream.rstrip("/")
+    UPSTREAM = (args.upstream or PROVIDER_UPSTREAMS[args.provider]).rstrip("/")
+    target = urlsplit(UPSTREAM)
+    if target.scheme not in ("http", "https") or not target.netloc or target.query or target.fragment:
+        parser.error("--upstream must be an HTTP(S) base URL without a query or fragment")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Tap)
     server.daemon_threads = True
     print(f"proxy listening on http://localhost:{args.port}  ->  {UPSTREAM}")
     serve_ui(args.ui_port)
-    print(f"run the agent with:  ANTHROPIC_BASE_URL=http://localhost:{args.port} claude")
+    print(f"run {args.provider} with:  ./{args.provider}-proxy --proxy-port {args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -947,7 +1044,7 @@ details.inp pre{color:var(--fg);background:var(--panel);border:1px solid var(--l
 .siderow .x{overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
 body.hide-side .call.side{display:none}
 body.hide-thinking .k-think{display:none}
-body.hide-injected .k-inj{display:none}
+body.hide-injected .k-inj,body.hide-injected .setup{display:none}
 .miss{display:none!important}
 mark{background:var(--hl);color:inherit}
 
@@ -956,7 +1053,7 @@ mark{background:var(--hl);color:inherit}
 @media (max-width:900px){#totals{margin-left:0}.k-user .body,.k-inj details{max-width:90%}}
 </style>
 </head>
-<body class="hide-side">
+<body class="hide-side hide-injected">
 <header>
   <h1>Agent traffic</h1>
   <div id="status" class="down"><span class="dot"></span><span id="statustext">connecting…</span></div>
@@ -964,7 +1061,7 @@ mark{background:var(--hl);color:inherit}
   <div class="filters">
     <label><input type="checkbox" id="f-side"> side calls</label>
     <label><input type="checkbox" id="f-think" checked> thinking</label>
-    <label><input type="checkbox" id="f-inj" checked> injected context</label>
+    <label><input type="checkbox" id="f-inj"> show context</label>
   </div>
   <input type="search" id="search" placeholder="Search thread…">
   <span id="matches"></span>
@@ -972,7 +1069,7 @@ mark{background:var(--hl);color:inherit}
 </header>
 <main id="scroller">
   <div id="thread">
-    <div class="empty" id="empty">Waiting for traffic…<br>Run the agent with <code>ANTHROPIC_BASE_URL=http://localhost:8041 claude</code></div>
+    <div class="empty" id="empty">Waiting for traffic…<br>Run the agent with <code>./codex-proxy</code></div>
   </div>
 </main>
 <button id="newbtn" hidden></button>
@@ -1003,6 +1100,125 @@ const num = n => (n == null ? '–' : Number(n).toLocaleString());
 const kfmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
 const secs = ms => ms == null ? '' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s';
 const clock = t => new Date(t).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+
+/* BEGIN readable context helpers */
+/* Readable-view filtering only: raw requests and forwarded bytes stay untouched. */
+const AGENT_CONTEXT_TAGS = new Set([
+  'environment_context', 'environment-context', 'system-reminder', 'system_reminder',
+  'conversation_context', 'conversation-context', 'context', 'injected_context',
+  'developer', 'developer_instructions', 'developer-instructions',
+  'system', 'system_instructions', 'system-instructions', 'instructions',
+  'permissions', 'permissions_instructions', 'permissions-instructions',
+  'collaboration_mode', 'collaboration-mode', 'turn_aborted',
+  'user-prompt-submit-hook', 'local-command-caveat',
+]);
+function isAgentContextTag(name) {
+  name = name.toLowerCase();
+  return AGENT_CONTEXT_TAGS.has(name) || /^ide_[a-z_]+$/.test(name) || /^local-command-[a-z-]+$/.test(name);
+}
+
+function splitAgentContext(value) {
+  const source = String(value == null ? '' : value);
+  const visible = [], contexts = [], stack = [];
+  let i = 0, code = null, root = null;
+  const append = text => { if (root) root.text += text; else visible.push(text); };
+  const finish = () => {
+    if (root) contexts.push({tag: root.tag, text: root.text.trim()});
+    root = null;
+    stack.length = 0;
+  };
+  while (i < source.length) {
+    // Preserve code examples verbatim, including literal protocol-looking tags.
+    const tick = source.slice(i).match(/^(`+|~{3,})/);
+    if (tick && (tick[1][0] === '`' || /(^|\n) {0,3}$/.test(source.slice(0, i)))) {
+      const mark = tick[1];
+      if (!code) code = mark;
+      else if (code[0] === mark[0] && (code.length < 3 ? code.length === mark.length : mark.length >= code.length)) code = null;
+      append(mark);
+      i += mark.length;
+      continue;
+    }
+    if (!code && source[i] === '<') {
+      const tag = source.slice(i).match(/^<\s*(\/?)\s*([a-z][a-z0-9_-]*)(?:\s+[^<>]*?)?\s*(\/?)>/i);
+      if (tag && isAgentContextTag(tag[2])) {
+        const name = tag[2].toLowerCase();
+        if (!tag[1]) {
+          if (!root) root = {tag: name, text: ''};
+          if (!tag[3]) stack.push(name);
+          else if (!stack.length) finish();
+        } else {
+          const at = stack.lastIndexOf(name);
+          if (at >= 0) {
+            stack.length = at;
+            if (!stack.length) finish();
+          }
+          // A trailing known closing delimiter is protocol noise, not user text.
+        }
+        i += tag[0].length;
+        continue;
+      }
+      // A stream may currently end halfway through a known opening delimiter.
+      // Withhold that suffix until a subsequent repaint completes the block.
+      const partial = source.slice(i).match(/^<\s*\/?\s*([a-z][a-z0-9_-]*)$/i);
+      if (partial && partial[1].length >= 3 && [...AGENT_CONTEXT_TAGS].some(name => name.startsWith(partial[1].toLowerCase()))) {
+        if (!root) root = {tag: partial[1].toLowerCase(), text: ''};
+        i = source.length;
+        break;
+      }
+      // Also handle an opening tag whose attributes have not finished streaming.
+      const unfinished = source.slice(i).match(/^<\s*([a-z][a-z0-9_-]*)\s+[^<>]*$/i);
+      if (unfinished && isAgentContextTag(unfinished[1])) {
+        if (!root) root = {tag: unfinished[1].toLowerCase(), text: ''};
+        i = source.length;
+        break;
+      }
+    }
+    append(source[i++]);
+  }
+  // Unclosed context blocks remain hidden; their contents may still be streaming.
+  finish();
+  return {text: visible.join('').trim(), contexts};
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {splitAgentContext, isAgentContextTag};
+}
+
+/* Readable message wrappers only; preserve code samples and arbitrary HTML/XML. */
+function stripAgentTags(value) {
+  const wrappers = new Set(['user_request', 'user_message', 'user_prompt', 'assistant_response', 'final_answer']);
+  const source = String(value == null ? '' : value), out = [];
+  let i = 0, code = null;
+  while (i < source.length) {
+    const run = source.slice(i).match(/^(`+|~{3,})/);
+    if (run && (run[1][0] === '`' || /(^|\n) {0,3}$/.test(source.slice(0, i)))) {
+      const mark = run[1];
+      if (!code) code = mark;
+      else if (code[0] === mark[0] && (code.length < 3 ? code.length === mark.length : mark.length >= code.length)) code = null;
+      out.push(mark);
+      i += mark.length;
+      continue;
+    }
+    if (!code && source[i] === '<') {
+      const tag = source.slice(i).match(/^<\s*\/?\s*([a-z_][a-z0-9_-]*)(?:\s+[^<>]*?)?\s*\/?>/i);
+      if (tag && wrappers.has(tag[1].toLowerCase())) {
+        i += tag[0].length;
+        continue;
+      }
+      // Withhold a recognized delimiter suffix while a streaming repaint awaits
+      // the rest. A short '<u' remains literal to avoid hiding normal prose.
+      const partial = source.slice(i).match(/^<\s*\/?\s*([a-z_][a-z0-9_-]*)$/i);
+      if (partial && partial[1].length >= 3 && [...wrappers].some(name => name.startsWith(partial[1].toLowerCase()))) break;
+      const attributes = source.slice(i).match(/^<\s*\/?\s*([a-z_][a-z0-9_-]*)\s+[^<>]*$/i);
+      if (attributes && wrappers.has(attributes[1].toLowerCase())) break;
+    }
+    out.push(source[i++]);
+  }
+  return out.join('');
+}
+if (typeof module !== 'undefined' && module.exports) module.exports = {stripAgentTags};
+
+/* END readable context helpers */
 
 /* ---------- tiny markdown: fences, inline code, lists, headings, bold/italic ---------- */
 function inline(s) {
@@ -1157,9 +1373,9 @@ function clampIfLong(el, text, lines = 30, chars = 3500) {
 }
 
 function userText(call, text, track) {
-  const parts = [];
-  const re = /<(system-reminder|ide_[a-z_]+|local-command-[a-z-]+|user-prompt-submit-hook)>([\s\S]*?)<\/\1>/g;
-  let rest = text.replace(re, (m, tag, inner) => { parts.push([tag, inner.trim()]); return ''; }).trim();
+  const filtered = splitAgentContext(text);
+  const parts = filtered.contexts.map(part => [part.tag, part.text]);
+  let rest = stripAgentTags(filtered.text).trim();
   if (/^Caveat: The messages below were generated/.test(rest)) { parts.push(['caveat', rest]); rest = ''; }
   const s = call.s;
   if (rest) {
@@ -1177,7 +1393,7 @@ function userText(call, text, track) {
 function injected(call, tag, inner) {
   const e = h('div', 'entry k-inj');
   const d = h('details');
-  d.innerHTML = `<summary>${icon('inj')}<span>injected by agent · ${esc(tag)}</span><span class="peek">${esc(inner.replace(/\s+/g, ' ').slice(0, 90))}</span></summary>`;
+  d.innerHTML = `<summary>${icon('inj')}<span>injected context</span></summary>`;
   const pre = h('pre');
   pre.textContent = inner;
   d.appendChild(pre);
@@ -1278,8 +1494,15 @@ function modelText(call, text, streaming) {
   e.appendChild(b);
   const t = {e, b, text: text || ''};
   t.render = (done) => {
-    b.innerHTML = md(t.text) + (done ? '' : '<span class="cursor"></span>');
-    if (done) clampIfLong(b, t.text, 60, 6000);
+    const parsed = splitAgentContext(t.text);
+    const readable = stripAgentTags(parsed.text);
+    if (done && !t.contextRendered) {
+      for (const context of parsed.contexts) injected(call, context.tag, context.text);
+      t.contextRendered = true;
+    }
+    e.hidden = !readable.trim();
+    b.innerHTML = md(readable) + (done ? '' : '<span class="cursor"></span>');
+    if (done) clampIfLong(b, readable, 60, 6000);
   };
   t.render(!streaming);
   add(call.body, e, call.s);
@@ -1300,6 +1523,11 @@ function divider(call, text) {
 
 function renderMessage(call, msg, track) {
   const blocks = typeof msg.content === 'string' ? [{type: 'text', text: msg.content}] : (msg.content || []);
+  if (msg.role === 'system' || msg.role === 'developer') {
+    const text = blocks.map(b => b && (b.text || b.thinking || '')).filter(Boolean).join('\n');
+    if (text) injected(call, msg.role, text);
+    return;
+  }
   for (const b of blocks) {
     if (!b) continue;
     if (msg.role === 'user') {
@@ -1386,7 +1614,7 @@ function onCallStart(ev) {
         <div class="tools">${ev.tools.map(t => `<span>${esc(t)}</span>`).join('')}</div>`;
     }
     if (tr.new && tr.index > 1)
-      divider(call, `new conversation thread "${tr.label}" (subagent or replaced context) · ${sysLine} · “${ev.system_summary.first_line.slice(0, 80)}”`);
+      divider(call, `new conversation thread "${tr.label}" (subagent or replaced context)`);
     if (tr.rewritten)
       divider(call, `history rewritten by the agent: ${tr.rewritten} message${tr.rewritten === 1 ? '' : 's'} replaced`);
     for (const m of ev.new_messages || []) renderMessage(call, m, tr);
@@ -1410,7 +1638,8 @@ function updateSideRow(call) {
   const ev = call.ev, e = call.end;
   const bits = [ev.side_reason];
   if (ev.model) bits.push(ev.model);
-  if (call.sideText) bits.push('“' + call.sideText.replace(/\s+/g, ' ').slice(0, 120) + '”');
+  const preview = stripAgentTags(splitAgentContext(call.sideText).text).trim();
+  if (preview) bits.push('“' + preview.replace(/\s+/g, ' ').slice(0, 120) + '”');
   call.row.querySelector('.x').textContent = bits.join(' · ');
   call.row.querySelector('.st').textContent = e
     ? `${e.status ?? 'ERR'} · ${secs(e.duration_ms)}${e.error ? ' · ' + e.error.slice(0, 80) : ''}`
@@ -1516,7 +1745,8 @@ function onCallEnd(ev) {
 /* ---------- search ---------- */
 function searchNode(n) {
   if (!n.classList) return;
-  const hit = !S.q || n.textContent.toLowerCase().includes(S.q);
+  const hiddenContext = document.body.classList.contains('hide-injected') && n.classList.contains('k-inj');
+  const hit = !hiddenContext && (!S.q || n.textContent.toLowerCase().includes(S.q));
   if (n.classList.contains('entry') || n.classList.contains('siderow')) n.classList.toggle('miss', !hit);
 }
 function applySearch() {
@@ -1545,7 +1775,7 @@ $('#session').addEventListener('change', e => {
 const bindFilter = (id, cls) => {
   const c = $(id);
   const apply = () => document.body.classList.toggle(cls, !c.checked);
-  c.addEventListener('change', () => { apply(); if (S.stick) scrollBottom(); });
+  c.addEventListener('change', () => { apply(); applySearch(); if (S.stick) scrollBottom(); });
   apply();
 };
 bindFilter('#f-side', 'hide-side');
